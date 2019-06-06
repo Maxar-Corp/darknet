@@ -71,7 +71,7 @@ void reset_network_state(dn_network *net, int b)
     int i;
     for (i = 0; i < net->n; ++i) {
         #ifdef GPU
-        layer l = net->layers[i];
+        dn_layer l = net->layers[i];
         if(l.state_gpu){
             fill_gpu(l.outputs, 0, l.state_gpu + l.outputs*b, 1);
         }
@@ -185,6 +185,50 @@ dn_network *make_network(int n)
     return net;
 }
 
+void emit_layer_output(dn_layer* l, int index) {
+    char file_name[64];
+    sprintf(file_name, "layer_%d.bin", index);
+
+    FILE *fp = fopen(file_name, "w");
+
+    if(fp) {
+        unsigned int layer_num = index;
+        unsigned int channels = l->out_c;
+        unsigned int rows = l->out_h;
+        unsigned int columns = l->out_w;
+
+        fprintf(stderr, "%s, dn_layer=%u, channels=%u, rows=%u, columns=%u, num_values=%u\n", file_name, layer_num, channels, rows, columns, channels * rows * columns);
+        // MGMG header is 4 x uint32:
+        // 0 - layer_num
+        // 1 - channels
+        // 2 - rows
+        // 3 - columns
+
+        fwrite(&layer_num, sizeof(unsigned int), 1, fp);
+        fwrite(&channels, sizeof(unsigned int), 1, fp);
+        fwrite(&rows, sizeof(unsigned int), 1, fp);
+        fwrite(&columns, sizeof(unsigned int), 1, fp);
+
+        // MGMG now write the net's current output in channel:rows:columns order
+        // this format is how darknet stores out already, so the task is just
+        // dumping the existing array to a file.
+        // x86 is little-endian, so MacOS and Ubuntu on x86 should be compatible
+
+
+        int num_outputs = l->outputs;
+        // MGMG sanity check
+        if(num_outputs != channels * rows * columns) {
+            fprintf(stderr, "output dimensions do not match: net.outputs == %d, channels(%u) x rows(%u) x columns(%u) == %u\n",
+                    num_outputs, channels, rows, columns, channels * rows * columns);
+        }
+        float* output = l->output;
+        fwrite(output, sizeof(float), num_outputs, fp);
+        fclose(fp);
+    } else {
+        fprintf(stderr, "could not open dn_layer output file '%s'\n", file_name);
+    }
+}
+
 void forward_network(dn_network *netp)
 {
 #ifdef GPU
@@ -202,6 +246,9 @@ void forward_network(dn_network *netp)
             fill_cpu(l.outputs * l.batch, 0, l.delta, 1);
         }
         l.forward(l, net);
+        // MGMG record outputs for dn_layer
+        emit_layer_output(&l, i);
+
         net.input = l.output;
         if(l.truth) {
             net.truth = l.output;
@@ -347,7 +394,7 @@ void set_batch_network(dn_network *net, int b)
             cudnn_convolutional_setup(net->layers + i);
         }
         if(net->layers[i].type == DECONVOLUTIONAL){
-            layer *l = net->layers + i;
+            dn_layer *l = net->layers + i;
             cudnnSetTensor4dDescriptor(l->dstTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, l->out_c, l->out_h, l->out_w);
             cudnnSetTensor4dDescriptor(l->normTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, l->out_c, 1, 1); 
         }
@@ -396,7 +443,7 @@ int resize_network(dn_network *net, int w, int h)
         }else if(l.type == COST){
             resize_cost_layer(&l, inputs);
         }else{
-            error("Cannot resize this type of layer");
+            error("Cannot resize this type of dn_layer");
         }
         if(l.workspace_size > workspace_size) workspace_size = l.workspace_size;
         if(l.workspace_size > 2000000000) assert(0);
@@ -445,7 +492,7 @@ dn_layer get_network_detection_layer(dn_network *net)
             return net->layers[i];
         }
     }
-    fprintf(stderr, "Detection layer not found!!\n");
+    fprintf(stderr, "Detection dn_layer not found!!\n");
     dn_layer l = {0};
     return l;
 }
@@ -759,9 +806,9 @@ float *network_output(dn_network *net)
 
 #ifdef GPU
 
-void forward_network_gpu(network *netp)
+void forward_network_gpu(dn_network *netp)
 {
-    network net = *netp;
+    dn_network net = *netp;
     cuda_set_device(net.gpu_index);
     cuda_push_array(net.input_gpu, net.input, net.inputs*net.batch);
     if(net.truth){
@@ -771,7 +818,7 @@ void forward_network_gpu(network *netp)
     int i;
     for(i = 0; i < net.n; ++i){
         net.index = i;
-        layer l = net.layers[i];
+        dn_layer l = net.layers[i];
         if(l.delta_gpu){
             fill_gpu(l.outputs * l.batch, 0, l.delta_gpu, 1);
         }
@@ -787,19 +834,19 @@ void forward_network_gpu(network *netp)
     calc_network_cost(netp);
 }
 
-void backward_network_gpu(network *netp)
+void backward_network_gpu(dn_network *netp)
 {
     int i;
-    network net = *netp;
-    network orig = net;
+    dn_network net = *netp;
+    dn_network orig = net;
     cuda_set_device(net.gpu_index);
     for(i = net.n-1; i >= 0; --i){
-        layer l = net.layers[i];
+        dn_layer l = net.layers[i];
         if(l.stopbackward) break;
         if(i == 0){
             net = orig;
         }else{
-            layer prev = net.layers[i-1];
+            dn_layer prev = net.layers[i-1];
             net.input = prev.output;
             net.delta = prev.delta;
             net.input_gpu = prev.output_gpu;
@@ -810,9 +857,9 @@ void backward_network_gpu(network *netp)
     }
 }
 
-void update_network_gpu(network *netp)
+void update_network_gpu(dn_network *netp)
 {
-    network net = *netp;
+    dn_network net = *netp;
     cuda_set_device(net.gpu_index);
     int i;
     update_args a = {0};
@@ -828,20 +875,20 @@ void update_network_gpu(network *netp)
     a.t = (*net.t);
 
     for(i = 0; i < net.n; ++i){
-        layer l = net.layers[i];
+        dn_layer l = net.layers[i];
         if(l.update_gpu){
             l.update_gpu(l, a);
         }
     }
 }
 
-void harmless_update_network_gpu(network *netp)
+void harmless_update_network_gpu(dn_network *netp)
 {
-    network net = *netp;
+    dn_network net = *netp;
     cuda_set_device(net.gpu_index);
     int i;
     for(i = 0; i < net.n; ++i){
-        layer l = net.layers[i];
+        dn_layer l = net.layers[i];
         if(l.weight_updates_gpu) fill_gpu(l.nweights, 0, l.weight_updates_gpu, 1);
         if(l.bias_updates_gpu) fill_gpu(l.nbiases, 0, l.bias_updates_gpu, 1);
         if(l.scale_updates_gpu) fill_gpu(l.nbiases, 0, l.scale_updates_gpu, 1);
@@ -849,8 +896,8 @@ void harmless_update_network_gpu(network *netp)
 }
 
 typedef struct {
-    network *net;
-    data d;
+    dn_network *net;
+    dn_data d;
     float *err;
 } train_args;
 
@@ -863,7 +910,7 @@ void *train_thread(void *ptr)
     return 0;
 }
 
-pthread_t train_network_in_thread(network *net, data d, float *err)
+pthread_t train_network_in_thread(dn_network *net, dn_data d, float *err)
 {
     pthread_t thread;
     train_args *ptr = (train_args *)calloc(1, sizeof(train_args));
@@ -874,7 +921,7 @@ pthread_t train_network_in_thread(network *net, data d, float *err)
     return thread;
 }
 
-void merge_weights(layer l, layer base)
+void merge_weights(dn_layer l, dn_layer base)
 {
     if (l.type == CONVOLUTIONAL) {
         axpy_cpu(l.n, 1, l.bias_updates, 1, base.biases, 1);
@@ -888,7 +935,7 @@ void merge_weights(layer l, layer base)
     }
 }
 
-void scale_weights(layer l, float s)
+void scale_weights(dn_layer l, float s)
 {
     if (l.type == CONVOLUTIONAL) {
         scal_cpu(l.n, s, l.biases, 1);
@@ -903,7 +950,7 @@ void scale_weights(layer l, float s)
 }
 
 
-void pull_weights(layer l)
+void pull_weights(dn_layer l)
 {
     if(l.type == CONVOLUTIONAL || l.type == DECONVOLUTIONAL){
         cuda_pull_array(l.biases_gpu, l.bias_updates, l.n);
@@ -915,7 +962,7 @@ void pull_weights(layer l)
     }
 }
 
-void push_weights(layer l)
+void push_weights(dn_layer l)
 {
     if(l.type == CONVOLUTIONAL || l.type == DECONVOLUTIONAL){
         cuda_push_array(l.biases_gpu, l.biases, l.n);
@@ -927,7 +974,7 @@ void push_weights(layer l)
     }
 }
 
-void distribute_weights(layer l, layer base)
+void distribute_weights(dn_layer l, dn_layer base)
 {
     if (l.type == CONVOLUTIONAL || l.type == DECONVOLUTIONAL) {
         cuda_push_array(l.biases_gpu, base.biases, l.n);
@@ -942,7 +989,7 @@ void distribute_weights(layer l, layer base)
 
 /*
 
-   void pull_updates(layer l)
+   void pull_updates(dn_layer l)
    {
    if(l.type == CONVOLUTIONAL){
    cuda_pull_array(l.bias_updates_gpu, l.bias_updates, l.n);
@@ -954,7 +1001,7 @@ void distribute_weights(layer l, layer base)
    }
    }
 
-   void push_updates(layer l)
+   void push_updates(dn_layer l)
    {
    if(l.type == CONVOLUTIONAL){
    cuda_push_array(l.bias_updates_gpu, l.bias_updates, l.n);
@@ -966,7 +1013,7 @@ void distribute_weights(layer l, layer base)
    }
    }
 
-   void update_layer(layer l, network net)
+   void update_layer(dn_layer l, dn_network net)
    {
    int update_batch = net.batch*net.subdivisions;
    float rate = get_current_rate(net);
@@ -975,7 +1022,7 @@ void distribute_weights(layer l, layer base)
    l.update_gpu(l, update_batch, rate*l.learning_rate_scale, net.momentum, net.decay);
    }
    }
-   void merge_updates(layer l, layer base)
+   void merge_updates(dn_layer l, dn_layer base)
    {
    if (l.type == CONVOLUTIONAL) {
    axpy_cpu(l.n, 1, l.bias_updates, 1, base.bias_updates, 1);
@@ -989,7 +1036,7 @@ void distribute_weights(layer l, layer base)
    }
    }
 
-   void distribute_updates(layer l, layer base)
+   void distribute_updates(dn_layer l, dn_layer base)
    {
    if(l.type == CONVOLUTIONAL || l.type == DECONVOLUTIONAL){
    cuda_push_array(l.bias_updates_gpu, base.bias_updates, l.n);
@@ -1003,49 +1050,49 @@ void distribute_weights(layer l, layer base)
  */
 
 /*
-   void sync_layer(network *nets, int n, int j)
+   void sync_layer(dn_network *nets, int n, int j)
    {
    int i;
-   network net = nets[0];
-   layer base = net.layers[j];
+   dn_network net = nets[0];
+   dn_layer base = net.layers[j];
    scale_weights(base, 0);
    for (i = 0; i < n; ++i) {
    cuda_set_device(nets[i].gpu_index);
-   layer l = nets[i].layers[j];
+   dn_layer l = nets[i].layers[j];
    pull_weights(l);
    merge_weights(l, base);
    }
    scale_weights(base, 1./n);
    for (i = 0; i < n; ++i) {
    cuda_set_device(nets[i].gpu_index);
-   layer l = nets[i].layers[j];
+   dn_layer l = nets[i].layers[j];
    distribute_weights(l, base);
    }
    }
  */
 
-void sync_layer(network **nets, int n, int j)
+void sync_layer(dn_network **nets, int n, int j)
 {
     int i;
-    network *net = nets[0];
-    layer base = net->layers[j];
+    dn_network *net = nets[0];
+    dn_layer base = net->layers[j];
     scale_weights(base, 0);
     for (i = 0; i < n; ++i) {
         cuda_set_device(nets[i]->gpu_index);
-        layer l = nets[i]->layers[j];
+        dn_layer l = nets[i]->layers[j];
         pull_weights(l);
         merge_weights(l, base);
     }
     scale_weights(base, 1./n);
     for (i = 0; i < n; ++i) {
         cuda_set_device(nets[i]->gpu_index);
-        layer l = nets[i]->layers[j];
+        dn_layer l = nets[i]->layers[j];
         distribute_weights(l, base);
     }
 }
 
 typedef struct{
-    network **nets;
+    dn_network **nets;
     int n;
     int j;
 } sync_args;
@@ -1058,7 +1105,7 @@ void *sync_layer_thread(void *ptr)
     return 0;
 }
 
-pthread_t sync_layer_in_thread(network **nets, int n, int j)
+pthread_t sync_layer_in_thread(dn_network **nets, int n, int j)
 {
     pthread_t thread;
     sync_args *ptr = (sync_args *)calloc(1, sizeof(sync_args));
@@ -1069,7 +1116,7 @@ pthread_t sync_layer_in_thread(network **nets, int n, int j)
     return thread;
 }
 
-void sync_nets(network **nets, int n, int interval)
+void sync_nets(dn_network **nets, int n, int interval)
 {
     int j;
     int layers = nets[0]->n;
@@ -1088,7 +1135,7 @@ void sync_nets(network **nets, int n, int interval)
     free(threads);
 }
 
-float train_networks(network **nets, int n, data d, int interval)
+float train_networks(dn_network **nets, int n, dn_data d, int interval)
 {
     int i;
     int batch = nets[0]->batch;
@@ -1099,7 +1146,7 @@ float train_networks(network **nets, int n, data d, int interval)
 
     float sum = 0;
     for(i = 0; i < n; ++i){
-        data p = get_data_part(d, i, n);
+        dn_data p = get_data_part(d, i, n);
         threads[i] = train_network_in_thread(nets[i], p, errors + i);
     }
     for(i = 0; i < n; ++i){
@@ -1120,9 +1167,9 @@ float train_networks(network **nets, int n, data d, int interval)
     return (float)sum/(n);
 }
 
-void pull_network_output(network *net)
+void pull_network_output(dn_network *net)
 {
-    layer l = get_network_output_layer(net);
+    dn_layer l = get_network_output_layer(net);
     cuda_pull_array(l.output_gpu, l.output, l.outputs*l.batch);
 }
 
